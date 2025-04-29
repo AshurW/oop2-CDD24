@@ -49,8 +49,9 @@ def create_todo():
     return jsonify(new_todo.to_dict()), 201
 
 @app.route('/todos', methods=['GET'])
+@jwt_required()
 def get_todos():
-
+    user_id = get_jwt_identity()
     # Hämta query params med request.args.get()
     status = request.args.get('status')  # Filter på status (completed)
     category = request.args.get('category')  # Filter på kategori
@@ -58,11 +59,9 @@ def get_todos():
     offset = request.args.get('offset', 0, type=int)
 
     # Skapa query baserat på filtreringsparametrar
-    query = Todo.query
+    query = Todo.query.filter(Todo.user_id == user_id)
 
     total_todos = query.count()
-
-    query = query.filter(Todo.user_id == user_id)
 
     if status is not None:
         completed = status.lower() == 'true'
