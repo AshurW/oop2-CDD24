@@ -1,6 +1,9 @@
 from datetime import datetime
 from flask import Flask, jsonify, request
-from models import db, Todo
+from flask_migrate import Migrate
+from models import db, Todo, User
+from auth import auth
+from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
 
 
 app = Flask(__name__)
@@ -8,19 +11,25 @@ app = Flask(__name__)
 # Konfigurera SQLite-databasen
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///todos.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['JWT_SECRET_KEY'] = 'din-hemliga-nyckel'  # Byt ut mot en säker nyckel i produktion
 
 # Initiera databasen
 db.init_app(app)
+jwt = JWTManager(app)
+
+app.register_blueprint(auth, url_prefix='/auth')
 
 # Skapa databastabeller
 with app.app_context():
     db.create_all()
 
-todos = []
+migrate = Migrate(app, db)
 
 
 @app.route('/todos', methods=['POST'])
+@jwt_required()
 def create_todo():
+    user_id = get_jwt_identity()
     data = request.get_json()
 
     if not data or 'title' not in data:
@@ -30,7 +39,8 @@ def create_todo():
         title=data['title'],
         completed=data.get('completed', False),
         deadline=datetime.fromisoformat(data['deadline']) if 'deadline' in data else None,
-        category=data.get('category')
+        category=data.get('category'),
+        user_id=user_id
     )
 
     db.session.add(new_todo)
@@ -43,14 +53,16 @@ def get_todos():
 
     # Hämta query params med request.args.get()
     status = request.args.get('status')  # Filter på status (completed)
-    s = request.query_string
-    print(s)
     category = request.args.get('category')  # Filter på kategori
     limit = request.args.get('limit', 10, type=int)
     offset = request.args.get('offset', 0, type=int)
 
     # Skapa query baserat på filtreringsparametrar
     query = Todo.query
+
+    total_todos = query.count()
+
+    query = query.filter(Todo.user_id == user_id)
 
     if status is not None:
         completed = status.lower() == 'true'
@@ -67,13 +79,46 @@ def get_todos():
     for todo in todos:
         todo_list.append(todo.to_dict())
 
-    return jsonify(todo_list)
+    page = (offset // limit) + 1 if limit > 0 else 1
+    next_offset= page * limit
+    pages = (total_todos + limit - 1) // limit if limit > 0 else 1
+    next_link = f'http://127.0.0.1:5000/todos?limit={limit}&offset={next_offset}'
+
+    return jsonify({
+        'data': todo_list,
+        'meta': {
+            'total': total_todos,
+            'limit': limit,
+            'offset': offset,
+            'page': (offset // limit) + 1 if limit > 0 else 1,
+            'pages': (total_todos + limit - 1) // limit if limit > 0 else 1,
+            'next': next_link,
+            'previous': f'?limit={limit}&offset={10}'
+        }
+    })
+
+@app.route('/todos/search', methods=['GET'])
+def search_todo():
+    search_term = request.args.get('q')
+    if not search_term:
+        return jsonify({'error': 'Sökterm krävs'}), 400
+    
+    print(search_term)
+    
+    todos = Todo.query.filter(Todo.title.like(f'%{search_term}%'))
+
+    return jsonify([todo.to_dict() for todo in todos])
+
 
 @app.route('/todos/<int:todo_id>', methods=['GET'])
+@jwt_required()
 def get_todo(todo_id):
+    user_id = get_jwt_identity()
     print('inside function')
     todo = Todo.query.get_or_404(todo_id)
-    return jsonify(todo.to_dict())
+    if todo.user_id == user_id:
+        return jsonify(todo.to_dict())
+    return jsonify({"message": "no todo with that id"}), 404
 
 @app.route('/todos/<int:todo_id>', methods=['PUT'])
 def update_todo(todo_id):
@@ -115,6 +160,48 @@ def get_todos_sorted_by_deadline():
 def get_todos_by_category(category):
     todos = Todo.query.filter_by(category=category).all()
     return jsonify([todo.to_dict() for todo in todos])
+
+
+@app.route('/todos/stats', methods=['GET'])
+def get_todo_stats():
+    total_count = Todo.query.count()
+
+    status_stats = db.session.query(
+        Todo.completed,
+        db.func.count(Todo.id)
+    ).group_by(Todo.completed).all()
+    print(status_stats)
+
+    # Konvertera till dictionary för enklare användning
+    status_dict = {
+        'completed': 0,
+        'active': 0
+    }
+
+    for completed, count in status_stats:
+        if completed:
+            status_dict['completed'] = count
+        else:
+            status_dict['active'] = count
+
+    category_stats = db.session.query(
+        Todo.category,
+        db.func.count(Todo.id)
+    ).group_by(Todo.category).all()
+
+        # Konvertera till dictionary
+    category_dict = {}
+    for category, count in category_stats:
+        category_name = category if category else 'uncategorized'
+        category_dict[category_name] = count
+
+    # Returnera sammanlagd statistik
+    return jsonify({
+        'total': total_count,
+        'by_status': status_dict,
+        'by_category': category_dict
+    })
+
 
 
 @app.route('/')
